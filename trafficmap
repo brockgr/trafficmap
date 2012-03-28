@@ -3,6 +3,7 @@
 # "This product includes GeoLite data created by MaxMind, available from http://www.maxmind.com/."
 
 # perlbrew install -J4 -Duseithreads perl-5.14.2
+# cpan]> install Net::Pcap NetPacket::IP Net::Traceroute Geo::IP::PurePerl
 
 use strict;
 use warnings;
