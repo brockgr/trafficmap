@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/usr/bin/perl
 
 # "This product includes GeoLite data created by MaxMind, available from http://www.maxmind.com/."
 
@@ -8,6 +8,9 @@
 use strict;
 use warnings;
 use threads;
+use threads::shared;
+use Thread::Queue;
+
 
 use Getopt::Long qw(:config no_auto_abbrev);
 use Pod::Usage;
@@ -17,7 +20,9 @@ use NetPacket::IP;
 use Net::Traceroute;
 use Geo::IP::PurePerl;
 
-my %options = ();
+my %options = (
+  tracers => 30,
+);
 
 
 GetOptions(\%options, qw{
@@ -30,10 +35,38 @@ pod2usage({ -verbose => 2, -exitval => 0 }) if $options{help};
 
 my $gi = Geo::IP::PurePerl->open("GeoLiteCity.dat", GEOIP_MEMORY_CACHE);
 
-threads->create(sub {
-  warn "ok";
-  sleep 10;
-});
+my %src_counts : shared;
+my %dst_counts : shared;
+my $to_trace = Thread::Queue->new();
+my %traced : shared;
+
+threads->create(sub { for (;;) {
+  foreach my $ip (sort { $src_counts{$a} <=> $src_counts{$b} } keys %src_counts) {
+    my $len =  $src_counts{$ip};
+    #print "$len $ip\n";
+    $to_trace->enqueue({ ip => $ip, len => $len });
+  }
+  %src_counts = ();
+    
+  sleep 2;
+} });
+
+
+for (1..$options{tracers}) {
+  threads->create(sub { for (;;) {
+    my $info = $to_trace->dequeue();
+    my $hops = traceroute($info->{ip});
+  } });
+}
+
+threads->create(sub { for (;;) {
+  my $n = $to_trace->pending();
+  print "$n requests in trace queue\n";
+  print keys(%traced)." traces cached\n";
+  sleep 5;
+}});
+
+
 
 my $err = '';
 my $filter;
@@ -46,9 +79,6 @@ pcap_setfilter($pcap, $filter);
 pcap_loop($pcap, 0, \&process_packet, '');
 pcap_close($pcap);
 
-
-
-my (%src_counts,%dst_counts);
 sub process_packet {
   my ($user_data, $header, $packet) = @_;
   my $eth_obj = NetPacket::Ethernet->decode($packet);
@@ -58,18 +88,27 @@ sub process_packet {
   my $dst = $ip_obj->{dest_ip};
   my $len = $ip_obj->{len};
 
-  if ($src eq $my_ip) {
+  if ($dst eq $my_ip) {
+    $src_counts{$src} ||= 0;
     $src_counts{$src} += $len;
-  } elsif ($dst eq $my_ip) {
+  } elsif ($src eq $my_ip) {
+    $dst_counts{$dst} ||= 0;
     $dst_counts{$dst} += $len;
   }
-  print "$src $dst $len\n";
+  #print "$src $dst $len\n";
   #traceroute($src);
 }
 
 sub traceroute {
   my ($ip) = @_;
 
+  {
+    lock %traced;
+    my $hops = $traced{$ip};
+    return $hops if $hops;
+  }
+
+  print "Tracing $ip\n";
   my $tr = Net::Traceroute->new(
     use_icmp => 1,
     query_timeout => 1,
@@ -77,15 +116,26 @@ sub traceroute {
     host => $ip,
   );
 
+  my @hops : shared;
   if ($tr->found) {
     my $hops = $tr->hops;
     foreach (my $hop=0; $hop < $tr->hops; $hop++) {
       my $router = $tr->hop_query_host($hop,0);
       if ($router) {
-        print "$hop: $router\n";
+        #print "$hop: $router\n";
         my @geo = $gi->get_city_record($router);
-        print "$geo[3] $geo[6],$geo[7]\n";
+        #print "$geo[3] $geo[6],$geo[7]\n";
+        my $lat : shared = $geo[6];
+        my $lng : shared = $geo[7];
+        my @ll :  shared = ($lat,$lng);
+        my $hop : shared = \@ll;
+        push @hops, $hop;
       }
+    }
+    print "$ip ".@hops." hops\n";
+    {
+      lock %traced;
+      return $traced{$ip} = \@hops;
     }
   }
 
