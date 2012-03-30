@@ -3,7 +3,8 @@
 # "This product includes GeoLite data created by MaxMind, available from http://www.maxmind.com/."
 
 # perlbrew install -J4 -Duseithreads perl-5.14.2
-# cpan]> install Net::Pcap NetPacket::IP Net::Traceroute Geo::IP::PurePerl
+# [cpan]> install Net::Pcap NetPacket::IP Net::Traceroute Geo::IP::PurePerl 
+# Geo::IP2Location
 
 use strict;
 use warnings;
@@ -19,8 +20,10 @@ use NetPacket::Ethernet;
 use NetPacket::IP;
 use Net::Traceroute;
 use Geo::IP::PurePerl;
+use Geo::IP2Location;
 
 my %options = (
+  traffic_grouping_time => 5, # secs
   tracers => 30,
 );
 
@@ -35,43 +38,75 @@ pod2usage({ -verbose => 2, -exitval => 0 }) if $options{help};
 
 my $gi = Geo::IP::PurePerl->open("GeoLiteCity.dat", GEOIP_MEMORY_CACHE);
 
-my %src_counts : shared;
-my %dst_counts : shared;
-my $to_trace = Thread::Queue->new();
-my %traced : shared;
+#my $geoip2 = Geo::IP2Location->open("IP-COUNTRY-REGION-CITY-LATITUDE-LONGITUDE-ISP-DOMAIN.BIN");
+#my $latitude = $obj->get_latitude("20.11.187.239");
+#my $longitude = $obj->get_longitude("20.11.187.239");
 
+
+my %traffic : shared; # Data bytes seen by src/dst IP
+my $to_trace = Thread::Queue->new(); # IP's to traceroute
+my %tracing : shared; # IP's being tracerouted, with bytes seen
+my %traced : shared; # Cached hop arrays, by IP
+my $hop_data = shared_clone({}); # Data by lat-lng location
+
+# This thread collects the captured data every "traffic_grouping_time"
+# and queue up traceroutes for the sources and destinationd
 threads->create(sub { for (;;) {
-  foreach my $ip (sort { $src_counts{$a} <=> $src_counts{$b} } keys %src_counts) {
-    my $len =  $src_counts{$ip};
-    #print "$len $ip\n";
-    $to_trace->enqueue({ ip => $ip, len => $len });
+  sleep $options{traffic_grouping_time};
+  {
+    lock %traffic;
+    while (my ($ip, $len) = each %traffic) {
+      {
+        lock %tracing;
+        $to_trace->enqueue($ip) unless $tracing{$ip};
+        $tracing{$ip} = $len;
+      }
+    }
+    %traffic = ();
   }
-  %src_counts = ();
-    
-  sleep 2;
 } });
 
 
+# Spawn "tracers" seperate threads to handle the collection of
+# traceroute hops, and then use the hops to generate the hop_data
 for (1..$options{tracers}) {
   threads->create(sub { for (;;) {
-    my $info = $to_trace->dequeue();
-    my $hops = traceroute($info->{ip});
+    my $ip = $to_trace->dequeue();
+    my $hops = traceroute($ip);
+
+    my $len = do {
+      lock %tracing;
+      delete $tracing{$ip};
+    };
+
+    next if @$hops < 2; # Too local, or failed
+    for my $i (1..(@$hops-1)) {
+      if ($hops->[$i-1] ne $hops->[$i]) {
+print "$hops->[$i-1] => $hops->[$i] : $len\n";
+        lock $hop_data;
+        my $from = $hop_data->{$hops->[$i-1]} ||= shared_clone({});
+        my $to   = $from->{$hops->[$i]} ||= shared_clone([]);
+        push @$to, shared_clone({ t => time, l => $len });
+        # TODO - purge old @$to's from the end
+      }
+    }
+
   } });
 }
 
+# Logging thread - give us an idea what is happening
 threads->create(sub { for (;;) {
   my $n = $to_trace->pending();
   print "$n requests in trace queue\n";
+  print keys(%tracing)-$n." traces in progress\n";
   print keys(%traced)." traces cached\n";
   sleep 5;
 }});
 
 
 
-my $err = '';
-my $filter;
-my $my_ip = '172.23.200.157';
-
+# Main packet capture code, and event loop
+my ($err, $filter);
 my $dev = $options{interface} || pcap_lookupdev(\$err);
 my $pcap = pcap_open_live($dev, 1024, 1, 5, \$err) or die "fatal: can't open network device $dev: $!";
 pcap_compile($pcap, \$filter, "not icmp", 0, 0) == 0 or die "fatal: filter error\n";
@@ -88,16 +123,12 @@ sub process_packet {
   my $dst = $ip_obj->{dest_ip};
   my $len = $ip_obj->{len};
 
-  if ($dst eq $my_ip) {
-    $src_counts{$src} ||= 0;
-    $src_counts{$src} += $len;
-  } elsif ($src eq $my_ip) {
-    $dst_counts{$dst} ||= 0;
-    $dst_counts{$dst} += $len;
-  }
-  #print "$src $dst $len\n";
-  #traceroute($src);
+  $traffic{$src} ||= 0;
+  $traffic{$src} += $len;
+  $traffic{$dst} ||= 0;
+  $traffic{$dst} += $len;
 }
+
 
 sub traceroute {
   my ($ip) = @_;
@@ -117,26 +148,24 @@ sub traceroute {
   );
 
   my @hops : shared;
+  my $last_ll = '';
   if ($tr->found) {
     my $hops = $tr->hops;
     foreach (my $hop=0; $hop < $tr->hops; $hop++) {
       my $router = $tr->hop_query_host($hop,0);
-      if ($router) {
-        #print "$hop: $router\n";
-        my @geo = $gi->get_city_record($router);
-        #print "$geo[3] $geo[6],$geo[7]\n";
-        my $lat : shared = $geo[6];
-        my $lng : shared = $geo[7];
-        my @ll :  shared = ($lat,$lng);
-        my $hop : shared = \@ll;
-        push @hops, $hop;
-      }
+      next unless $router;
+      my @geo = $gi->get_city_record($router);
+      next unless defined($geo[6]) && defined($geo[7]);
+      my $ll = "$geo[6],$geo[7]";
+      #print "$hop: $router $ll\n";
+      next unless $ll != $last_ll;
+      push @hops, $last_ll = $ll;
     }
     print "$ip ".@hops." hops\n";
-    {
+    return do {
       lock %traced;
-      return $traced{$ip} = \@hops;
-    }
+      $traced{$ip} = \@hops;
+    };
   }
 
 }
